@@ -15,6 +15,13 @@ endif()
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -flto -DNDEBUG")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic")
 
+# Optional AddressSanitizer + UBSan build
+option(ENABLE_SANITIZERS "Build with AddressSanitizer and UBSan" OFF)
+if(ENABLE_SANITIZERS)
+    add_compile_options(-fsanitize=address,undefined -g -O1)
+    add_link_options(-fsanitize=address,undefined)
+endif()
+
 # Disable exceptions and RTTI for latency-sensitive code
 # Note: Comment out if you need exceptions
 # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-exceptions -fno-rtti")
@@ -65,6 +72,7 @@ if(BUILD_TESTING)
         tests/test_order_book.cpp
         tests/test_object_pool.cpp
         tests/test_ring_buffer.cpp
+        tests/test_matching_engine.cpp
     )
     
     # Create test executable

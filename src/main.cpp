@@ -15,6 +15,7 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <csignal>
 #include <cstring>
 #include <thread>
 #include <atomic>
@@ -61,7 +62,7 @@ public:
         // Set TCP_NODELAY for low latency
         int flag = 1;
         setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-        
+
         // Set socket to non-blocking
         int flags = fcntl(fd_, F_GETFL, 0);
         fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
@@ -129,6 +130,10 @@ public:
         int opt = 1;
         setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
+        // Set listen socket non-blocking so accept() returns on SIGINT
+        int flags = fcntl(listen_fd_, F_GETFL, 0);
+        fcntl(listen_fd_, F_SETFL, flags | O_NONBLOCK);
+
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = INADDR_ANY;
@@ -151,13 +156,13 @@ public:
     [[nodiscard]] std::optional<TCPSocket> accept() const {
         sockaddr_in client_addr{};
         socklen_t addr_len = sizeof(client_addr);
-        
+
         int client_fd = ::accept(listen_fd_, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
         if (client_fd < 0) {
             return std::nullopt;
         }
 
-        std::cout << "Accepted connection from " << inet_ntoa(client_addr.sin_addr) 
+        std::cout << "Accepted connection from " << inet_ntoa(client_addr.sin_addr)
                   << ":" << ntohs(client_addr.sin_port) << std::endl;
         return TCPSocket(client_fd);
     }
@@ -177,7 +182,7 @@ public:
 
     MessageBuffer() : data_{}, pos_(0), expected_length_(0) {}
 
-    // Read available data from socket
+    // Read available data from socket; returns 0 on EOF/error, SIZE_MAX on EAGAIN
     size_t read_from_socket(const TCPSocket& socket) {
         size_t available = BUFFER_SIZE - pos_;
         if (available == 0) {
@@ -261,6 +266,8 @@ void network_thread_func(
     TCPServer& server,
     MatchingEngine<>::InputQueue& input_queue,
     MatchingEngine<>::OrderPool& order_pool,
+    MatchingEngine<>::CancelQueue& cancel_queue,
+    std::atomic<int>& client_fd,
     std::atomic<bool>& running
 ) {
     set_thread_affinity(0);  // Pin to core 0
@@ -276,10 +283,19 @@ void network_thread_func(
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
             }
+            // Share fd with output thread
+            client_fd.store(client_socket->fd(), std::memory_order_release);
         }
 
-        // Read data from socket
-        buffer.read_from_socket(*client_socket);
+        // Read data from socket; returns 0 on EOF/error
+        size_t bytes = buffer.read_from_socket(*client_socket);
+        if (bytes == 0) {
+            // Client disconnected or hard error
+            client_fd.store(-1, std::memory_order_release);
+            client_socket.reset();
+            buffer = MessageBuffer{};
+            continue;
+        }
 
         // Extract and process messages
         buffer.extract_messages([&](std::span<const std::byte> message_span) -> bool {
@@ -306,12 +322,12 @@ void network_thread_func(
                     }
                 }
             }
-            // Handle cancel order
+            // Handle cancel order — forward to matching thread via cancel queue
             else if (*msg_type == MessageType::CancelOrder) {
                 CancelOrderMessage msg;
                 if (MessageParser::parse_cancel_order(message_span, msg)) {
-                    // Cancel orders are handled differently - would need order_id mapping
-                    // For now, skip
+                    cancel_queue.try_push(msg.order_id);
+                    return true;
                 }
             }
 
@@ -329,6 +345,7 @@ void network_thread_func(
 void matching_thread_func(
     MatchingEngine<>& engine,
     MatchingEngine<>::InputQueue& input_queue,
+    MatchingEngine<>::CancelQueue& cancel_queue,
     MatchingEngine<>::OutputQueue& output_queue,
     MatchingEngine<>::TradeQueue& trade_queue,
     std::atomic<bool>& running
@@ -339,7 +356,8 @@ void matching_thread_func(
     size_t orders_processed = 0;
 
     while (running.load(std::memory_order_acquire)) {
-        const size_t processed = engine.process_inbound_orders(input_queue, output_queue, trade_queue);
+        const size_t processed = engine.process_inbound_orders(
+            input_queue, cancel_queue, output_queue, trade_queue);
         orders_processed += processed;
 
         if (processed == 0) {
@@ -359,32 +377,46 @@ void matching_thread_func(
 }
 
 // ============================================================================
-// OUTPUT THREAD (sends execution reports)
+// OUTPUT THREAD (sends execution reports back to client)
 // ============================================================================
 
 void output_thread_func(
     MatchingEngine<>::OutputQueue& output_queue,
     MatchingEngine<>::TradeQueue& trade_queue,
+    std::atomic<int>& client_fd,
     std::atomic<bool>& running
 ) {
     set_thread_affinity(2);  // Pin to core 2
 
     uint32_t sequence = 0;
 
+    // Helper: write a framed message to the connected client
+    auto send_framed = [&](const auto& wire_msg) {
+        int fd = client_fd.load(std::memory_order_acquire);
+        if (fd < 0) return;  // no client connected
+
+        auto body = MessageEncoder::encode_array(wire_msg);
+
+        // Write 4-byte frame header (big-endian length) then message body
+        FrameHeader frame{static_cast<std::uint32_t>(body.size())};
+        frame.to_network_order();
+        ::write(fd, &frame, sizeof(frame));
+        ::write(fd, body.data(), body.size());
+    };
+
     while (running.load(std::memory_order_acquire)) {
-        // Process execution reports
+        // Send execution reports
         ExecutionReport report;
         while (output_queue.try_pop(report)) {
             auto msg = ExecutionReportMessage::from_report(report, sequence++);
-            // In real implementation, send to client socket
-            // For now, just count
+            send_framed(msg);
         }
 
-        // Process trades
+        // Send trade notifications
         Trade trade;
         while (trade_queue.try_pop(trade)) {
             auto msg = TradeMessage::from_trade(trade, sequence++);
-            // In real implementation, broadcast to market data subscribers
+            send_framed(msg);
         }
 
         std::this_thread::sleep_for(std::chrono::microseconds(10));
@@ -392,10 +424,20 @@ void output_thread_func(
 }
 
 // ============================================================================
-// MAIN
+// SIGNAL HANDLER
 // ============================================================================
 
 } // namespace apexlob
+
+// Global pointer so the signal handler can reach the running flag
+static std::atomic<bool>* g_running = nullptr;
+static void shutdown_handler(int) {
+    if (g_running) g_running->store(false, std::memory_order_release);
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
 
 int main(int argc, char* argv[]) {
     using namespace apexlob;
@@ -406,13 +448,18 @@ int main(int argc, char* argv[]) {
     std::cout << "=== ApexLOB - Ultra-Low-Latency Limit Order Book ===" << std::endl;
     std::cout << "Port: " << port << std::endl;
 
-    // Create matching engine
-    MatchingEngine<> engine(symbol);
+    // Heap-allocate all large objects — combined they exceed 27 MB which
+    // overflows the default 8 MB stack on macOS/Linux if left as locals.
+    auto engine       = std::make_unique<MatchingEngine<>>(symbol);
+    auto input_queue  = std::make_unique<MatchingEngine<>::InputQueue>();
+    auto output_queue = std::make_unique<MatchingEngine<>::OutputQueue>();
+    auto trade_queue  = std::make_unique<MatchingEngine<>::TradeQueue>();
 
-    // Create queues
-    MatchingEngine<>::InputQueue input_queue;
-    MatchingEngine<>::OutputQueue output_queue;
-    MatchingEngine<>::TradeQueue trade_queue;
+    // Cancel queue: network thread pushes OrderId, matching thread drains
+    auto cancel_queue = std::make_unique<MatchingEngine<>::CancelQueue>();
+
+    // Shared client socket fd: network thread sets on connect, output thread reads to send
+    std::atomic<int> client_fd{-1};
 
     // Create TCP server
     TCPServer server(port);
@@ -421,38 +468,41 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Control flag
+    // Control flag and signal handler
     std::atomic<bool> running{true};
+    g_running = &running;
+    std::signal(SIGINT,  shutdown_handler);
+    std::signal(SIGTERM, shutdown_handler);
 
     // Start threads
     std::thread network_thread(network_thread_func,
                                std::ref(server),
-                               std::ref(input_queue),
-                               std::ref(engine.order_pool()),
+                               std::ref(*input_queue),
+                               std::ref(engine->order_pool()),
+                               std::ref(*cancel_queue),
+                               std::ref(client_fd),
                                std::ref(running));
 
     std::thread matching_thread(matching_thread_func,
-                                std::ref(engine),
-                                std::ref(input_queue),
-                                std::ref(output_queue),
-                                std::ref(trade_queue),
+                                std::ref(*engine),
+                                std::ref(*input_queue),
+                                std::ref(*cancel_queue),
+                                std::ref(*output_queue),
+                                std::ref(*trade_queue),
                                 std::ref(running));
 
     std::thread output_thread(output_thread_func,
-                              std::ref(output_queue),
-                              std::ref(trade_queue),
+                              std::ref(*output_queue),
+                              std::ref(*trade_queue),
+                              std::ref(client_fd),
                               std::ref(running));
 
     std::cout << "All threads started. Press Ctrl+C to stop." << std::endl;
 
-    // Wait for interrupt
-    try {
-        network_thread.join();
-        matching_thread.join();
-        output_thread.join();
-    } catch (...) {
-        running.store(false, std::memory_order_release);
-    }
+    // Wait for threads to finish
+    network_thread.join();
+    matching_thread.join();
+    output_thread.join();
 
     std::cout << "Shutting down..." << std::endl;
     return 0;

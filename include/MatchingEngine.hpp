@@ -41,6 +41,7 @@ public:
     using InputQueue = SPSCRingBuffer<Order*, InputQueueSize>;
     using OutputQueue = SPSCRingBuffer<ExecutionReport, OutputQueueSize>;
     using TradeQueue = SPSCRingBuffer<Trade, TradeQueueSize>;
+    using CancelQueue = SPSCRingBuffer<OrderId, 1024>;
 
     explicit MatchingEngine(Symbol symbol) noexcept
         : symbol_(symbol)
@@ -75,35 +76,81 @@ public:
         return processed;
     }
 
+    // Process incoming orders and also drain cancel queue (cancels take priority)
+    std::size_t process_inbound_orders(InputQueue& input_queue,
+                                       CancelQueue& cancel_queue,
+                                       OutputQueue& output_queue,
+                                       TradeQueue& trade_queue) noexcept {
+        // Drain cancel queue first — clients expect fast cancels
+        OrderId cancel_id;
+        while (cancel_queue.try_pop(cancel_id)) {
+            cancel_order(cancel_id, output_queue);
+        }
+        // Then process new orders
+        return process_inbound_orders(input_queue, output_queue, trade_queue);
+    }
+
     // Process single order (for testing or direct submission)
     void process_order(Order* order,
                       OutputQueue& output_queue,
                       TradeQueue& trade_queue) noexcept {
+        // Assign order ID and timestamp first (before validation)
+        order->id = next_order_id_++;
+        order->entry_timestamp = rdtsc();
+
         if (!OrderValidator::is_valid_order(*order)) {
             reject_order(order, output_queue);
             return;
         }
 
-        // Assign order ID
-        order->id = next_order_id_++;
-        order->entry_timestamp = rdtsc();
-
         // Store in order map
         order_map_[order->id] = order;
+
+        // FOK: cancel immediately if full quantity cannot be filled
+        if (order->type == OrderType::FOK && !can_fill_completely(order)) {
+            order->cancel();
+            send_execution_report(order, output_queue);
+            order_map_.erase(order->id);
+            order_pool_.release(order);
+            return;
+        }
 
         // Attempt matching
         match_order(order, output_queue, trade_queue);
 
-        // Add to book if not fully filled
-        if (!order->is_fully_filled() && order->status != ExecutionStatus::Cancelled) {
-            if (order->type == OrderType::Limit) {
+        if (order->is_fully_filled()) {
+            // Fully matched — report and return to pool
+            send_execution_report(order, output_queue);
+            order_map_.erase(order->id);
+            order_pool_.release(order);
+            return;
+        }
+
+        // Not fully filled — handle by order type
+        switch (order->type) {
+            case OrderType::Limit:
+                // Rest unfilled quantity in book
                 order_book_.add_order(order);
                 send_execution_report(order, output_queue);
-            } else if (order->type == OrderType::IOC) {
-                // Immediate-or-cancel: cancel remaining
+                break;  // stays in order_map_ for future cancellation
+
+            case OrderType::IOC:
+            case OrderType::Market:
+                // Cancel unfilled remainder, release resources
                 order->cancel();
                 send_execution_report(order, output_queue);
-            }
+                order_map_.erase(order->id);
+                order_pool_.release(order);
+                break;
+
+            case OrderType::FOK:
+                // Should not reach here (pre-scan prevents partial fills)
+                // Safety fallback: cancel and release
+                order->cancel();
+                send_execution_report(order, output_queue);
+                order_map_.erase(order->id);
+                order_pool_.release(order);
+                break;
         }
     }
 
@@ -145,6 +192,25 @@ public:
     }
 
 private:
+    // ---- FOK PRE-SCAN ----
+
+    // Read-only scan: returns true if full qty can be filled at crossing prices
+    [[nodiscard]] bool can_fill_completely(const Order* order) const noexcept {
+        const Order* resting = order->is_buy()
+            ? order_book_.best_ask_order()
+            : order_book_.best_bid_order();
+        Quantity available = 0;
+        while (resting != nullptr) {
+            // Market orders match at any price; others must cross
+            if (order->type != OrderType::Market && !order->can_match_with(*resting)) break;
+            if (order->client_id != resting->client_id)
+                available += resting->remaining_quantity();
+            if (available >= order->remaining_quantity()) return true;
+            resting = resting->next_;
+        }
+        return false;
+    }
+
     // ---- MATCHING LOGIC ----
 
     void match_order(Order* incoming_order,
@@ -156,14 +222,15 @@ private:
             : order_book_.best_bid_order();
 
         while (resting_order != nullptr && !incoming_order->is_fully_filled()) {
-            // Check if prices cross
-            if (!incoming_order->can_match_with(*resting_order)) {
+            // Check if prices cross — Market orders match at any price
+            if (incoming_order->type != OrderType::Market &&
+                !incoming_order->can_match_with(*resting_order)) {
                 break;
             }
 
             // Check self-match prevention
             if (incoming_order->client_id == resting_order->client_id) {
-                // Skip or cancel based on policy
+                // Skip resting order to avoid self-match
                 resting_order = resting_order->next_;
                 continue;
             }

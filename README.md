@@ -1,6 +1,6 @@
 # ApexLOB - Ultra-Low-Latency Limit Order Book
 
-A high-performance C++20 limit order book engine designed for high-frequency trading applications.
+From-scratch C++20 exchange matching engine over a three-thread lock-free pipeline: intrusive limit order book, price-time priority matching, zero-allocation object pool, SPSC ring buffers, fixed-width binary TCP protocol. Every published number resolves to a committed benchmark.
 
 **Measured performance** — 5.15M orders/sec sustained through the three-thread pipeline, with 792 ns p99 order-to-execution-report latency (416 ns median, one order in flight). Latencies are in-process and exclude the kernel network stack. See [`BENCHMARKS.md`](BENCHMARKS.md) for the full results, test environment, caveats, and repro commands.
 

@@ -21,6 +21,16 @@ cmake_install.cmake
 # Executables
 apexlob
 apexlob_tests
+apexlob_bench
+apexlob_latency
+
+# Personal notes: resume bullets, interview prep, private write-ups
+apexlob.md
+resume*.md
+interview*.md
+notes*.md
+prep/
+BENCHMARKS_LOCAL.md
 
 # IDE files
 .vscode/
@@ -35,3 +45,5 @@ Thumbs.db
 
 # Test output
 Testing/
+build-bench/
+build-asan/

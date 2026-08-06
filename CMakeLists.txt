@@ -94,6 +94,47 @@ if(BUILD_TESTING)
 endif()
 
 # ============================================================================
+# Benchmarks (Google Benchmark + standalone latency harness)
+# ============================================================================
+
+option(BUILD_BENCHMARKS "Build benchmarks" OFF)
+
+if(BUILD_BENCHMARKS)
+    include(FetchContent)
+
+    set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+    set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
+    set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+
+    FetchContent_Declare(
+        googlebenchmark
+        GIT_REPOSITORY https://github.com/google/benchmark.git
+        GIT_TAG v1.8.3
+    )
+    FetchContent_MakeAvailable(googlebenchmark)
+
+    # Microbenchmarks — per-component costs
+    add_executable(apexlob_bench
+        bench/bench_object_pool.cpp
+        bench/bench_ring_buffer.cpp
+        bench/bench_wire_protocol.cpp
+        bench/bench_order_book.cpp
+        bench/bench_matching_engine.cpp
+    )
+    target_link_libraries(apexlob_bench
+        benchmark::benchmark
+        benchmark::benchmark_main
+        pthread
+    )
+    target_include_directories(apexlob_bench PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
+    # Standalone harness — end-to-end latency percentiles and throughput
+    add_executable(apexlob_latency bench/latency_harness.cpp)
+    target_link_libraries(apexlob_latency pthread)
+    target_include_directories(apexlob_latency PRIVATE ${CMAKE_SOURCE_DIR}/include)
+endif()
+
+# ============================================================================
 # Installation (optional)
 # ============================================================================
 

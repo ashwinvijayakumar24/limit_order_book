@@ -1,6 +1,8 @@
 # ApexLOB - Ultra-Low-Latency Limit Order Book
 
-A high-performance C++20 limit order book engine designed for high-frequency trading applications, targeting sub-50 microsecond order-to-trade latency.
+A high-performance C++20 limit order book engine designed for high-frequency trading applications.
+
+**Measured performance** — 5.15M orders/sec sustained through the three-thread pipeline, with 792 ns p99 order-to-execution-report latency (416 ns median, one order in flight). Latencies are in-process and exclude the kernel network stack. See [`BENCHMARKS.md`](BENCHMARKS.md) for the full results, test environment, caveats, and repro commands.
 
 ## Features
 
@@ -83,6 +85,7 @@ cmake --build build
 | `BUILD_TESTING` | ON | Fetch GoogleTest and build test binary |
 | `CMAKE_BUILD_TYPE` | Release | Release (`-O3 -march=native -flto`) or Debug |
 | `ENABLE_SANITIZERS` | OFF | Compile with AddressSanitizer + UBSan for leak/UB detection |
+| `BUILD_BENCHMARKS` | OFF | Fetch Google Benchmark and build `apexlob_bench` + `apexlob_latency` |
 
 ```bash
 # Sanitizer build
@@ -90,6 +93,16 @@ cmake -B build_san -DENABLE_SANITIZERS=ON -DCMAKE_BUILD_TYPE=Debug
 cmake --build build_san
 ./build_san/apexlob_tests
 ```
+
+```bash
+# Benchmark build
+cmake -B build-bench -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCHMARKS=ON -DBUILD_TESTING=OFF
+cmake --build build-bench -j
+./build-bench/apexlob_latency 200000 10000    # end-to-end latency percentiles
+./build-bench/apexlob_bench --benchmark_min_time=0.3s --benchmark_filter="Pool|Heap"
+```
+
+See [`BENCHMARKS.md`](BENCHMARKS.md) for all results and the full set of filter commands.
 
 ## Testing
 

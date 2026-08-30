@@ -206,12 +206,28 @@ private:
             if (order->client_id != resting->client_id)
                 available += resting->remaining_quantity();
             if (available >= order->remaining_quantity()) return true;
-            resting = resting->next_;
+            const Price level_price = resting->price;
+            resting = next_resting(resting->next_, level_price, order->is_buy());
         }
         return false;
     }
 
     // ---- MATCHING LOGIC ----
+
+    // Step to the next resting order. The intrusive next_ chain only links
+    // orders within one price level, so when it runs out we ask the book for
+    // the best level strictly worse than the one just exhausted. Prices are
+    // monotonically worse each step, so this always makes progress.
+    [[nodiscard]] Order* next_resting(Order* next_in_level,
+                                      const Price& level_price,
+                                      bool incoming_is_buy) const noexcept {
+        if (next_in_level != nullptr) {
+            return next_in_level;
+        }
+        return incoming_is_buy
+            ? order_book_.best_ask_order_worse_than(level_price)
+            : order_book_.best_bid_order_worse_than(level_price);
+    }
 
     void match_order(Order* incoming_order,
                     OutputQueue& output_queue,
@@ -231,15 +247,21 @@ private:
             // Check self-match prevention
             if (incoming_order->client_id == resting_order->client_id) {
                 // Skip resting order to avoid self-match
-                resting_order = resting_order->next_;
+                const Price skipped_price = resting_order->price;
+                resting_order = next_resting(resting_order->next_, skipped_price,
+                                             incoming_order->is_buy());
                 continue;
             }
+
+            // Price of the level being consumed — captured before the resting
+            // order can be released back to the pool below
+            const Price level_price = resting_order->price;
 
             // Execute trade
             execute_trade(incoming_order, resting_order, output_queue, trade_queue);
 
-            // Get next resting order
-            Order* next_resting = resting_order->next_;
+            // Get next resting order (read before remove_order clears next_)
+            Order* next_in_level = resting_order->next_;
 
             // Remove fully filled resting order
             if (resting_order->is_fully_filled()) {
@@ -256,7 +278,8 @@ private:
                 send_execution_report(resting_order, output_queue);
             }
 
-            resting_order = next_resting;
+            resting_order = next_resting(next_in_level, level_price,
+                                         incoming_order->is_buy());
         }
     }
 

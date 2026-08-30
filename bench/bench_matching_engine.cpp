@@ -137,47 +137,53 @@ BENCHMARK(BM_ProcessOrder_FullMatchOneLevel)->UseManualTime();
 
 // ---- One aggressive order sweeping N resting orders across N levels ----
 // Reported time is per SWEEP (not per fill); divide by the arg for per-fill.
+// One aggressive order consuming `depth` distinct price levels.
+//
+// Each level holds exactly ONE resting order, and the sweeper is sized to take
+// all of them. That forces a real level-to-level walk. An earlier version of
+// this benchmark seeded 256 orders at each level while sizing the sweeper at
+// 100 * depth, so the sweeper could never exhaust even the best level — it
+// measured "consume N orders at one price", not "sweep N levels".
+//
+// Caveat: at depth 1 a single sweep is ~1-2 steady_clock ticks, so that row is
+// dominated by clock resolution. Compare rows, not absolute values, at low
+// depth.
 void BM_ProcessOrder_SweepLevels(benchmark::State& state) {
     const auto depth = static_cast<std::size_t>(state.range(0));
-    const std::size_t sweeps = 256;
+
+    // The fixture is built once, not per iteration: MatchingEngine embeds a
+    // ~38 MB order pool, and constructing that inside the loop would dominate
+    // wall time so badly the benchmark never converges. Each sweep consumes
+    // every seeded order and returns it to the pool, so the book is empty
+    // again at the top of each iteration.
+    EngineFixture fx;
 
     for (auto _ : state) {
-        EngineFixture fx;
-
-        // Seed `sweeps * depth` resting sells: depth distinct price levels,
-        // `sweeps` orders deep at each level.
+        // Seed `depth` price levels, one resting sell each (untimed).
         bool ok = true;
-        for (std::size_t s = 0; s < sweeps && ok; ++s) {
-            for (std::size_t i = 0; i < depth; ++i) {
-                Order* resting = fx.make_order(
-                    Side::Sell,
-                    Price{static_cast<std::int64_t>(BASE_PRICE_RAW + i * 100)},
-                    100, /*client=*/2);
-                if (resting == nullptr) { ok = false; break; }
-                fx.submit(resting);
-            }
+        for (std::size_t i = 0; i < depth; ++i) {
+            Order* resting = fx.make_order(
+                Side::Sell,
+                Price{static_cast<std::int64_t>(BASE_PRICE_RAW + i * 100)},
+                100, /*client=*/2);
+            if (resting == nullptr) { ok = false; break; }
+            fx.submit(resting);
         }
+        if (!ok) { state.SkipWithError("order pool exhausted"); break; }
 
-        std::vector<Order*> sweepers;
-        sweepers.reserve(sweeps);
-        for (std::size_t s = 0; s < sweeps; ++s) {
-            // Priced through every level, sized to consume one order per level.
-            Order* o = fx.make_order(
-                Side::Buy,
-                Price{static_cast<std::int64_t>(BASE_PRICE_RAW + depth * 100)},
-                static_cast<Quantity>(100 * depth), /*client=*/1);
-            if (o == nullptr) break;
-            sweepers.push_back(o);
-        }
+        // Priced through the whole book, sized to consume every level.
+        Order* sweeper = fx.make_order(
+            Side::Buy,
+            Price{static_cast<std::int64_t>(BASE_PRICE_RAW + depth * 100)},
+            static_cast<Quantity>(100 * depth), /*client=*/1);
+        if (sweeper == nullptr) { state.SkipWithError("order pool exhausted"); break; }
         fx.drain();
 
         const auto t0 = Clock::now();
-        for (Order* o : sweepers) fx.submit(o);
+        fx.submit(sweeper);
         const auto t1 = Clock::now();
 
-        state.SetIterationTime(
-            std::chrono::duration<double>(t1 - t0).count() /
-            static_cast<double>(sweepers.size()));
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
         fx.drain();
     }
     state.SetItemsProcessed(state.iterations() *

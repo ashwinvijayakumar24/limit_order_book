@@ -241,3 +241,112 @@ TEST_F(MatchingEngineTest, CancelOrder) {
     // A Cancelled execution report should have been emitted
     EXPECT_GE(drain_reports(ExecutionStatus::Cancelled), 1u);
 }
+
+// ============================================================================
+// REGRESSION: multi-level sweeping
+// ============================================================================
+// The intrusive next_ chain only links orders *within* one price level. Before
+// the fix, match_order and can_fill_completely walked that chain and stopped at
+// the end of the best level, so an aggressive order could never consume a
+// second price level. That left unfilled quantity resting on the book at a
+// price that crossed the other side.
+
+TEST_F(MatchingEngineTest, SweepsAcrossTwoPriceLevels) {
+    submit(make_order(Side::Sell, Price{50.00}, 50, OrderType::Limit, /*client_id=*/2));
+    submit(make_order(Side::Sell, Price{51.00}, 50, OrderType::Limit, /*client_id=*/2));
+
+    Order* buy = make_order(Side::Buy, Price{51.00}, 100, OrderType::Limit, /*client_id=*/1);
+    submit(buy);
+
+    // One trade per level consumed
+    EXPECT_EQ(drain_trades(), 2u);
+    // Everything filled, so nothing rests and the book is empty
+    EXPECT_EQ(engine->active_order_count(), 0u);
+    EXPECT_FALSE(engine->order_book().best_bid().has_value());
+    EXPECT_FALSE(engine->order_book().best_ask().has_value());
+}
+
+TEST_F(MatchingEngineTest, SweepsAcrossThreePriceLevels) {
+    submit(make_order(Side::Sell, Price{50.00}, 10, OrderType::Limit, /*client_id=*/2));
+    submit(make_order(Side::Sell, Price{50.50}, 10, OrderType::Limit, /*client_id=*/2));
+    submit(make_order(Side::Sell, Price{51.00}, 10, OrderType::Limit, /*client_id=*/2));
+
+    submit(make_order(Side::Buy, Price{51.00}, 30, OrderType::Limit, /*client_id=*/1));
+
+    EXPECT_EQ(drain_trades(), 3u);
+    EXPECT_EQ(engine->active_order_count(), 0u);
+}
+
+TEST_F(MatchingEngineTest, SweepStopsAtLimitPrice) {
+    submit(make_order(Side::Sell, Price{50.00}, 50, OrderType::Limit, /*client_id=*/2));
+    submit(make_order(Side::Sell, Price{52.00}, 50, OrderType::Limit, /*client_id=*/2));
+
+    // Only willing to pay 51 — must take the 50 level and stop, not the 52 level
+    Order* buy = make_order(Side::Buy, Price{51.00}, 100, OrderType::Limit, /*client_id=*/1);
+    submit(buy);
+
+    EXPECT_EQ(drain_trades(), 1u);
+    EXPECT_EQ(buy->filled_quantity, 50u);
+    EXPECT_EQ(buy->remaining_quantity(), 50u);
+    // Remainder rests as the best bid at 51, below the surviving 52 ask
+    auto bid = engine->order_book().best_bid();
+    auto ask = engine->order_book().best_ask();
+    ASSERT_TRUE(bid.has_value());
+    ASSERT_TRUE(ask.has_value());
+    EXPECT_EQ(*bid, Price{51.00});
+    EXPECT_EQ(*ask, Price{52.00});
+}
+
+TEST_F(MatchingEngineTest, SweepLeavesBookUncrossed) {
+    submit(make_order(Side::Sell, Price{50.00}, 50, OrderType::Limit, /*client_id=*/2));
+    submit(make_order(Side::Sell, Price{51.00}, 50, OrderType::Limit, /*client_id=*/2));
+
+    submit(make_order(Side::Buy, Price{51.00}, 100, OrderType::Limit, /*client_id=*/1));
+
+    // A bid and an ask at the same price must never coexist
+    EXPECT_FALSE(engine->order_book().is_crossed());
+}
+
+TEST_F(MatchingEngineTest, SellSweepsAcrossTwoBidLevels) {
+    submit(make_order(Side::Buy, Price{51.00}, 50, OrderType::Limit, /*client_id=*/2));
+    submit(make_order(Side::Buy, Price{50.00}, 50, OrderType::Limit, /*client_id=*/2));
+
+    submit(make_order(Side::Sell, Price{50.00}, 100, OrderType::Limit, /*client_id=*/1));
+
+    EXPECT_EQ(drain_trades(), 2u);
+    EXPECT_EQ(engine->active_order_count(), 0u);
+    EXPECT_FALSE(engine->order_book().is_crossed());
+}
+
+TEST_F(MatchingEngineTest, MarketOrderSweepsAllLevels) {
+    submit(make_order(Side::Sell, Price{50.00}, 25, OrderType::Limit, /*client_id=*/2));
+    submit(make_order(Side::Sell, Price{60.00}, 25, OrderType::Limit, /*client_id=*/2));
+
+    submit(make_order(Side::Buy, Price{0.0}, 50, OrderType::Market, /*client_id=*/1));
+
+    EXPECT_EQ(drain_trades(), 2u);
+    EXPECT_EQ(engine->active_order_count(), 0u);
+}
+
+TEST_F(MatchingEngineTest, FOKFillsAcrossTwoPriceLevels) {
+    submit(make_order(Side::Sell, Price{50.00}, 50, OrderType::Limit, /*client_id=*/2));
+    submit(make_order(Side::Sell, Price{51.00}, 50, OrderType::Limit, /*client_id=*/2));
+
+    // Fillable only by sweeping both levels — the pre-scan must see both
+    submit(make_order(Side::Buy, Price{51.00}, 100, OrderType::FOK, /*client_id=*/1));
+
+    EXPECT_EQ(drain_trades(), 2u);
+    EXPECT_EQ(engine->active_order_count(), 0u);
+}
+
+TEST_F(MatchingEngineTest, FOKStillKilledWhenBookTooThin) {
+    submit(make_order(Side::Sell, Price{50.00}, 30, OrderType::Limit, /*client_id=*/2));
+    submit(make_order(Side::Sell, Price{51.00}, 30, OrderType::Limit, /*client_id=*/2));
+
+    // 60 available across both levels, 100 requested -> all-or-nothing kill
+    submit(make_order(Side::Buy, Price{51.00}, 100, OrderType::FOK, /*client_id=*/1));
+
+    EXPECT_EQ(drain_trades(), 0u);
+    // Both sells still resting, untouched
+    EXPECT_EQ(engine->active_order_count(), 2u);
+}

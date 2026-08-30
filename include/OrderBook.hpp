@@ -141,6 +141,26 @@ public:
         return nullptr;
     }
 
+    // First order at the best price level strictly worse than `price`.
+    // Lets a sweeping order continue past a level it has exhausted; the
+    // intrusive next_ chain only links orders within a single level.
+    [[nodiscard]] Order* best_order_worse_than(const Price& price) const noexcept {
+        std::size_t best = MaxLevels;
+
+        for (std::size_t i = 0; i < level_count_; ++i) {
+            if (levels_[i].is_empty()) continue;
+            if (levels_[i].price == price) continue;
+            if (is_better_price(levels_[i].price, price)) continue;
+
+            if (best == MaxLevels ||
+                is_better_price(levels_[i].price, levels_[best].price)) {
+                best = i;
+            }
+        }
+
+        return best < MaxLevels ? levels_[best].head : nullptr;
+    }
+
     [[nodiscard]] std::optional<Price> best_price() const noexcept {
         const auto* level = best_level();
         if (level) {
@@ -337,6 +357,15 @@ public:
 
     [[nodiscard]] Order* best_ask_order() const noexcept {
         return ask_side_.best_order();
+    }
+
+    // Next price level down/up, for orders sweeping through multiple levels
+    [[nodiscard]] Order* best_bid_order_worse_than(const Price& price) const noexcept {
+        return bid_side_.best_order_worse_than(price);
+    }
+
+    [[nodiscard]] Order* best_ask_order_worse_than(const Price& price) const noexcept {
+        return ask_side_.best_order_worse_than(price);
     }
 
     [[nodiscard]] Symbol symbol() const noexcept {

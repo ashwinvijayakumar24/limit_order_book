@@ -90,7 +90,7 @@ Covers decode + SPSC hop + match + SPSC hop + cross-core visibility.
 
 ## 2. Object pool vs. heap allocation
 
-From `bench/bench_object_pool.cpp`. `Order` is 128 B, 64 B-aligned.
+From `bench/bench_object_pool.cpp`. `Order` is 192 B, 64 B-aligned.
 
 | Benchmark | Time/op | Rate |
 |---|---|---|
@@ -194,17 +194,34 @@ From `bench/bench_matching_engine.cpp`. Manual timing (batches of 2048), since
 | `ProcessOrder_FullMatchOneLevel` (one full fill + 2 reports) | **61.7 ns** |
 | `CancelOrder` (hash lookup + unlink + report + release) | **24.6 ns** |
 
-Sweeping N price levels with one aggressive order:
+### Sweeping N price levels — table pending re-measurement
 
-| Levels swept | Time per sweep | Time per fill |
-|---|---|---|
-| 1 | 62.3 ns | 62.3 ns |
-| 5 | 193 ns | 38.6 ns |
-| 20 | 829 ns | 41.5 ns |
-| 100 | 7316 ns | 73.2 ns |
+**The earlier numbers in this section were invalid and have been withdrawn.**
+`BM_ProcessOrder_SweepLevels` seeded 256 resting orders at *each* price level
+(25,600 quantity) while sizing the aggressive order at only `100 * depth`
+(≤ 10,000). The sweeper therefore could never exhaust even the best level: the
+benchmark measured *"consume N orders at a single price"*, not *"sweep N price
+levels"*. The old conclusion that per-fill cost stays flat with depth was an
+artifact of that — it never crossed a level boundary.
 
-Per-fill cost stays roughly flat (~40–70 ns) as sweep depth grows; the rise at
-100 levels reflects the O(levels) book operations from §5.
+The benchmark now seeds exactly one resting order per level, so the sweep is
+real. The qualitative result is the opposite of what was published:
+
+**Per-level cost grows with depth, so sweeping N levels is O(N²).** Each level
+consumed triggers `best_order_worse_than`, `find_level`, and
+`update_best_level`, all of which are O(levels) linear scans (§5). Measured
+per-level cost rose roughly 4× going from a 5-level to a 100-level sweep.
+
+This makes the linear-scan level lookup a worse bottleneck than §5 alone
+suggests: it is quadratic for sweeping orders, not linear. Replacing the scan
+with a sorted structure or price-indexed array remains the highest-value
+optimization, and it now has a second motivating case.
+
+Absolute figures are omitted deliberately. The only runs available were taken
+on a machine under load (load average ~2.9), where `best_bid()` measured 0.730
+ns against the 0.376 ns recorded in §5 for identical, untouched code — roughly
+2× across the board. This table must be regenerated on an idle machine before
+any number here is quoted.
 
 ---
 
@@ -220,14 +237,49 @@ cmake --build build-asan --target apexlob_tests
 ./build-asan/apexlob_tests
 ```
 
-Result: **36 / 36 tests pass under ASan + UBSan**, no sanitizer diagnostics.
+Result: **47 / 47 tests pass under ASan + UBSan**, no sanitizer diagnostics.
 
-Test suite breakdown (36 total): `test_ring_buffer` 10, `test_matching_engine`
-10, `test_order_book` 9, `test_object_pool` 7.
+Test suite breakdown (47 total): `test_matching_engine` 18, `test_ring_buffer`
+10, `test_order_book` 9, `test_object_pool` 7, `test_concurrency` 3.
 
-Note that LeakSanitizer is not enabled by default on macOS, so this run proves
-absence of overflows, use-after-free, and UB — not absence of leaks. The
-`PoolNotExhaustedAfterFills` test covers pool accounting directly instead.
+### Thread safety
+
+ASan and UBSan cannot see data races, which is the failure mode this codebase
+is most exposed to — the SPSC ring buffers and the CAS-based object pool are
+the only places two threads touch the same memory. ThreadSanitizer covers that
+gap and has its own build option (TSan and ASan cannot be combined):
+
+```
+cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DENABLE_TSAN=ON
+cmake --build build-tsan --target apexlob_tests
+./build-tsan/apexlob_tests
+```
+
+Result: **47 / 47 tests pass under TSan, zero data races reported.**
+
+`tests/test_concurrency.cpp` exists specifically to give TSan something real to
+inspect. It covers the three shapes that actually cross cores in `src/main.cpp`:
+a ring buffer carrying `Order*` with the consumer dereferencing through the
+pointer, an object pool acquired on one thread and released on another, and the
+full three-thread pipeline (producer → matching → output) over 20,000 orders.
+
+The TSan toolchain was verified against a deliberately racy program first, so
+the clean result reflects instrumentation that is actually running.
+
+### What is still not covered
+
+**Leaks.** LeakSanitizer is unsupported on this platform — `detect_leaks=1`
+reports `not supported on this platform` on arm64 macOS. These runs prove
+absence of overflows, use-after-free, and UB, and absence of data races. They do
+not prove absence of leaks. The `PoolNotExhaustedAfterFills` and
+`ObjectPoolAcquireAndReleaseOnDifferentThreads` tests check pool accounting
+directly instead, which covers the pool but not the process as a whole.
+
+**ABA in the object pool.** `ObjectPool::acquire()` is a Treiber-stack pop with
+no ABA protection. It is safe under the documented single-producer usage, and
+TSan reports no races, but TSan detects data races rather than ABA — the
+accesses involved are all atomic. Multi-producer use would need a tagged pointer
+or hazard pointers.
 
 ---
 

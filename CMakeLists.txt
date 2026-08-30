@@ -22,6 +22,18 @@ if(ENABLE_SANITIZERS)
     add_link_options(-fsanitize=address,undefined)
 endif()
 
+# Optional ThreadSanitizer build — detects data races in the lock-free queues
+# and object pool. Mutually exclusive with ASan/UBSan, so it needs its own
+# build directory: cmake -B build-tsan -DENABLE_TSAN=ON
+option(ENABLE_TSAN "Build with ThreadSanitizer" OFF)
+if(ENABLE_TSAN)
+    if(ENABLE_SANITIZERS)
+        message(FATAL_ERROR "ENABLE_TSAN and ENABLE_SANITIZERS are mutually exclusive")
+    endif()
+    add_compile_options(-fsanitize=thread -g -O1)
+    add_link_options(-fsanitize=thread)
+endif()
+
 # Disable exceptions and RTTI for latency-sensitive code
 # Note: Comment out if you need exceptions
 # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-exceptions -fno-rtti")
@@ -73,6 +85,7 @@ if(BUILD_TESTING)
         tests/test_object_pool.cpp
         tests/test_ring_buffer.cpp
         tests/test_matching_engine.cpp
+        tests/test_concurrency.cpp
     )
     
     # Create test executable

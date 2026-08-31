@@ -266,16 +266,35 @@ full three-thread pipeline (producer → matching → output) over 20,000 orders
 The TSan toolchain was verified against a deliberately racy program first, so
 the clean result reflects instrumentation that is actually running.
 
-### What is still not covered
+### Leaks
 
-**Leaks.** LeakSanitizer is unsupported on this platform — `detect_leaks=1`
-reports `not supported on this platform` on arm64 macOS. These runs prove
-absence of overflows, use-after-free, and UB, and absence of data races. They do
-not prove absence of leaks. The `PoolNotExhaustedAfterFills` and
-`ObjectPoolAcquireAndReleaseOnDifferentThreads` tests check pool accounting
-directly instead, which covers the pool but not the process as a whole.
+LeakSanitizer is unsupported on this platform: `ASAN_OPTIONS=detect_leaks=1`
+reports `detect_leaks is not supported on this platform` on arm64 macOS. It is
+a missing component, not a build setting.
 
-**ABA in the object pool.** `ObjectPool::acquire()` is a Treiber-stack pop with
+Apple's own `leaks(1)` does work here and covers the same ground:
+
+```
+leaks --atExit -- ./build/apexlob_tests
+```
+
+Result: **47 / 47 tests pass, 0 leaks for 0 total leaked bytes** (185 nodes,
+16 KB still reachable at exit — GTest and runtime residue).
+
+As with TSan, the tool was verified against a program with deliberately leaked
+allocations first; it reported them, so the clean result is meaningful.
+
+Caveat on what `leaks` measures: it reports allocations that are **unreachable**
+at process exit. It will not flag memory that stays reachable but grows without
+bound — a cache that is never evicted is a leak in practice but not by
+reachability — and it is a snapshot at exit rather than continuous monitoring.
+The `PoolNotExhaustedAfterFills` and
+`ObjectPoolAcquireAndReleaseOnDifferentThreads` tests cover pool accounting
+directly, which is the growth case `leaks` would miss.
+
+### Known gap: ABA in the object pool
+
+`ObjectPool::acquire()` is a Treiber-stack pop with
 no ABA protection. It is safe under the documented single-producer usage, and
 TSan reports no races, but TSan detects data races rather than ABA — the
 accesses involved are all atomic. Multi-producer use would need a tagged pointer

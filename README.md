@@ -1,4 +1,4 @@
-# ApexLOB - Ultra-Low-Latency Limit Order Book
+# Ultra-Low-Latency Limit Order Book and Matching Engine
 
 From-scratch C++20 exchange matching engine over a three-thread lock-free pipeline: intrusive limit order book, price-time priority matching, zero-allocation object pool, SPSC ring buffers, fixed-width binary TCP protocol. Every published number resolves to a committed benchmark.
 
